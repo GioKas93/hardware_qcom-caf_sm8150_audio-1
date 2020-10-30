@@ -305,6 +305,7 @@ int platform_set_device_params(struct stream_out *out, int param, int value);
 int platform_set_audio_device_interface(const char * device_name, const char *intf_name,
                                         const char * codec_type);
 void platform_set_gsm_mode(void *platform, bool enable);
+void platform_set_tx_lpi_mode(void *platform, bool enable);
 bool platform_can_enable_spkr_prot_on_device(snd_device_t snd_device);
 int platform_get_spkr_prot_acdb_id(snd_device_t snd_device);
 int platform_get_spkr_prot_snd_device(snd_device_t snd_device);
@@ -432,4 +433,5 @@ int platform_set_power_mode_on_device(struct audio_device* adev, snd_device_t sn
 int platform_set_island_cfg_on_device(struct audio_device* adev, snd_device_t snd_device,
                                       bool enable);
 void platform_reset_island_power_status(void *platform, snd_device_t snd_device);
+void platform_is_volume_boost_supported_device(void *platform, struct listnode *devices);
 #endif // AUDIO_PLATFORM_API_H

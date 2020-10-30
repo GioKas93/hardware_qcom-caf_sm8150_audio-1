@@ -423,6 +423,7 @@ const char * const use_case_table[AUDIO_USECASE_MAX] = {
     [USECASE_AUDIO_PLAYBACK_FRONT_PASSENGER] = "front-passenger-playback",
     [USECASE_AUDIO_PLAYBACK_REAR_SEAT] = "rear-seat-playback",
     [USECASE_AUDIO_FM_TUNER_EXT] = "fm-tuner-ext",
+    [USECASE_ICC_CALL] = "icc-call",
 };
 
 static const audio_usecase_t offload_usecases[] = {
@@ -518,7 +519,6 @@ static unsigned int audio_device_ref_count;
 //cache last MBDRC cal step level
 static int last_known_cal_step = -1 ;
 
-static int check_a2dp_restore_l(struct audio_device *adev, struct stream_out *out, bool restore);
 static int out_set_compr_volume(struct audio_stream_out *stream, float left, float right);
 static int out_set_mmap_volume(struct audio_stream_out *stream, float left, float right);
 static int out_set_voip_volume(struct audio_stream_out *stream, float left, float right);
@@ -1309,6 +1309,8 @@ int disable_audio_route(struct audio_device *adev,
                 platform_set_island_cfg_on_device(adev, usecase->in_snd_device, false);
                 platform_set_power_mode_on_device(adev, usecase->in_snd_device, false);
                 platform_reset_island_power_status(adev->platform, usecase->in_snd_device);
+                if (voice_is_lte_call_active(adev))
+                    platform_set_tx_lpi_mode(adev->platform, false);
                 ALOGD("%s: disable island cfg and power mode in voice tx path",
                       __func__);
             }
@@ -1430,6 +1432,10 @@ int enable_snd_device(struct audio_device *adev,
             platform_get_power_mode_on_device(adev->platform, snd_device)) {
             platform_set_island_cfg_on_device(adev, snd_device, true);
             platform_set_power_mode_on_device(adev, snd_device, true);
+            if (voice_is_lte_call_active(adev) &&
+                (snd_device >= SND_DEVICE_IN_BEGIN &&
+                 snd_device < SND_DEVICE_IN_END))
+               platform_set_tx_lpi_mode(adev->platform, true);
             ALOGD("%s: enable island cfg and power mode on: %s",
                    __func__, device_name);
         }
@@ -2688,7 +2694,8 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
 
     if ((usecase->type == VOICE_CALL) ||
         (usecase->type == VOIP_CALL)  ||
-        (usecase->type == PCM_HFP_CALL)) {
+        (usecase->type == PCM_HFP_CALL)||
+        (usecase->type == ICC_CALL)) {
         if(usecase->stream.out == NULL) {
             ALOGE("%s: stream.out is NULL", __func__);
             return -EINVAL;
@@ -3387,7 +3394,7 @@ static int send_offload_cmd_l(struct stream_out* out, int command)
     return 0;
 }
 
-/* must be called iwth out->lock locked */
+/* must be called with out->lock and latch lock */
 static void stop_compressed_output_l(struct stream_out *out)
 {
     out->offload_state = OFFLOAD_STATE_IDLE;
@@ -3648,9 +3655,11 @@ static int create_offload_callback_thread(struct stream_out *out)
 static int destroy_offload_callback_thread(struct stream_out *out)
 {
     lock_output_stream(out);
+    pthread_mutex_lock(&out->latch_lock);
     stop_compressed_output_l(out);
     send_offload_cmd_l(out, OFFLOAD_CMD_EXIT);
 
+    pthread_mutex_unlock(&out->latch_lock);
     pthread_mutex_unlock(&out->lock);
     pthread_join(out->offload_thread, (void **) NULL);
     pthread_cond_destroy(&out->offload_cond);
@@ -3725,6 +3734,9 @@ static int stop_output_stream(struct stream_out *out)
 
     list_remove(&uc_info->list);
     out->started = 0;
+    pthread_mutex_lock(&out->latch_lock);
+    out->muted = false;
+    pthread_mutex_unlock(&out->latch_lock);
     if (is_offload_usecase(out->usecase) &&
         (audio_extn_passthru_is_passthrough_stream(out))) {
         ALOGV("Disable passthrough , reset mixer to pcm");
@@ -3861,7 +3873,7 @@ int start_output_stream(struct stream_out *out)
             if (is_speaker_active || is_speaker_safe_active) {
                 a2dp_combo = true;
             } else {
-                if (!(out->flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)) {
+                if (!is_offload_usecase(out->usecase)) {
                     ALOGE("%s: A2DP profile is not ready, return error", __func__);
                     ret = -EAGAIN;
                     goto error_config;
@@ -4177,7 +4189,7 @@ int start_output_stream(struct stream_out *out)
     }
     audio_streaming_hint_end();
     audio_extn_perf_lock_release(&adev->perf_lock_handle);
-    ALOGV("%s: exit", __func__);
+    ALOGD("%s: exit", __func__);
 
     if (out->usecase == USECASE_AUDIO_PLAYBACK_ULL ||
         out->usecase == USECASE_AUDIO_PLAYBACK_MMAP) {
@@ -4545,8 +4557,11 @@ static int out_standby(struct audio_stream *stream)
         if (adev->adm_deregister_stream)
             adev->adm_deregister_stream(adev->adm_data, out->handle);
 
-        if (is_offload_usecase(out->usecase))
+        if (is_offload_usecase(out->usecase)) {
+            pthread_mutex_lock(&out->latch_lock);
             stop_compressed_output_l(out);
+            pthread_mutex_unlock(&out->latch_lock);
+        }
 
         pthread_mutex_lock(&adev->lock);
 
@@ -4623,7 +4638,9 @@ static int out_on_error(struct audio_stream *stream)
     // is needed e.g. when SSR happens within compress_open
     // since the stream is active, offload_callback_thread is also active.
     if (out->flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
+        pthread_mutex_lock(&out->latch_lock);
         stop_compressed_output_l(out);
+        pthread_mutex_unlock(&out->latch_lock);
     }
     pthread_mutex_unlock(&out->lock);
 
@@ -4645,8 +4662,8 @@ static int out_on_error(struct audio_stream *stream)
 }
 
 /*
- *standby implementation without locks, assumes that the callee already
- *has taken adev and out lock.
+ * standby implementation without locks, assumes that the callee already
+ * has taken adev and out lock.
  */
 int out_standby_l(struct audio_stream *stream)
 {
@@ -4661,8 +4678,11 @@ int out_standby_l(struct audio_stream *stream)
         if (adev->adm_deregister_stream)
             adev->adm_deregister_stream(adev->adm_data, out->handle);
 
-        if (is_offload_usecase(out->usecase))
+        if (is_offload_usecase(out->usecase)) {
+            pthread_mutex_lock(&out->latch_lock);
             stop_compressed_output_l(out);
+            pthread_mutex_unlock(&out->latch_lock);
+        }
 
         out->standby = true;
         if (out->usecase == USECASE_COMPRESS_VOIP_CALL) {
@@ -4968,6 +4988,7 @@ int route_output_stream(struct stream_out *out,
                     ret = voice_start_call(adev);
                 }
             } else {
+                platform_is_volume_boost_supported_device(adev->platform, &new_devices);
                 adev->current_call_output = out;
                 voice_update_devices_for_all_voice_usecases(adev);
             }
@@ -5008,13 +5029,14 @@ int route_output_stream(struct stream_out *out,
                 platform_set_swap_channels(adev, true);
                 audio_extn_perf_lock_release(&adev->perf_lock_handle);
             }
-            if ((out->flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) &&
-                 out->a2dp_compress_mute &&
+            if (is_offload_usecase(out->usecase) &&
                  (!is_a2dp_out_device_type(&out->device_list) || audio_extn_a2dp_source_is_ready())) {
-                pthread_mutex_lock(&out->compr_mute_lock);
-                out->a2dp_compress_mute = false;
-                out_set_compr_volume(&out->stream, out->volume_l, out->volume_r);
-                pthread_mutex_unlock(&out->compr_mute_lock);
+                pthread_mutex_lock(&out->latch_lock);
+                if (out->a2dp_compress_mute) {
+                    out->a2dp_compress_mute = false;
+                    out_set_compr_volume(&out->stream, out->volume_l, out->volume_r);
+                }
+                pthread_mutex_unlock(&out->latch_lock);
             } else if (out->usecase == USECASE_AUDIO_PLAYBACK_VOIP) {
                 out_set_voip_volume(&out->stream, out->volume_l, out->volume_r);
             }
@@ -5571,7 +5593,9 @@ static int out_set_volume(struct audio_stream_out *stream, float left,
     ALOGD("%s: called with left_vol=%f, right_vol=%f", __func__, left, right);
     if (out->usecase == USECASE_AUDIO_PLAYBACK_MULTI_CH) {
         /* only take left channel into account: the API is for stereo anyway */
+        pthread_mutex_lock(&out->latch_lock);
         out->muted = (left == 0.0f);
+        pthread_mutex_unlock(&out->latch_lock);
         return 0;
     } else if (is_offload_usecase(out->usecase)) {
         if (audio_extn_passthru_is_passthrough_stream(out)) {
@@ -5608,18 +5632,20 @@ static int out_set_volume(struct audio_stream_out *stream, float left,
                     out->volume_r = out_ctxt->output->volume_r;
                 }
             }
+            pthread_mutex_lock(&out->latch_lock);
             if (!out->a2dp_compress_mute) {
                 ret = out_set_compr_volume(&out->stream, out->volume_l, out->volume_r);
             }
+            pthread_mutex_unlock(&out->latch_lock);
             return ret;
         } else {
-            pthread_mutex_lock(&out->compr_mute_lock);
+            pthread_mutex_lock(&out->latch_lock);
             ALOGV("%s: compress mute %d", __func__, out->a2dp_compress_mute);
             if (!out->a2dp_compress_mute)
                 ret = out_set_compr_volume(stream, left, right);
             out->volume_l = left;
             out->volume_r = right;
-            pthread_mutex_unlock(&out->compr_mute_lock);
+            pthread_mutex_unlock(&out->latch_lock);
             return ret;
         }
     } else if (out->usecase == USECASE_AUDIO_PLAYBACK_VOIP) {
@@ -5878,7 +5904,7 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
         (audio_extn_a2dp_source_is_suspended())) {
         if (!(compare_device_type(&out->device_list, AUDIO_DEVICE_OUT_SPEAKER) ||
               compare_device_type(&out->device_list, AUDIO_DEVICE_OUT_SPEAKER_SAFE))) {
-            if (!(out->flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD)) {
+            if (!is_offload_usecase(out->usecase)) {
                 ret = -EIO;
                 goto exit;
             }
@@ -6035,7 +6061,9 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
             }
             audio_extn_dts_eagle_fade(adev, true, out);
             out->playback_started = 1;
+            pthread_mutex_lock(&out->latch_lock);
             out->offload_state = OFFLOAD_STATE_PLAYING;
+            pthread_mutex_unlock(&out->latch_lock);
 
             audio_extn_dts_notify_playback_state(out->usecase, 0, out->sample_rate,
                                                      popcount(out->channel_mask),
@@ -6047,8 +6075,10 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
     } else {
         if (out->pcm) {
             size_t bytes_to_write = bytes;
+            pthread_mutex_lock(&out->latch_lock);
             if (out->muted)
                 memset((void *)buffer, 0, bytes);
+            pthread_mutex_unlock(&out->latch_lock);
             ALOGV("%s: frames=%zu, frame_size=%zu, bytes_to_write=%zu",
                      __func__, frames, frame_size, bytes_to_write);
 
@@ -6422,6 +6452,7 @@ static int out_pause(struct audio_stream_out* stream)
         ALOGD("copl(%p):pause compress driver", out);
         status = -ENODATA;
         lock_output_stream(out);
+        pthread_mutex_lock(&out->latch_lock);
         if (out->compr != NULL && out->offload_state == OFFLOAD_STATE_PLAYING) {
             if (out->card_status != CARD_STATUS_OFFLINE)
                 status = compress_pause(out->compr);
@@ -6438,6 +6469,7 @@ static int out_pause(struct audio_stream_out* stream)
                                                  out->sample_rate, popcount(out->channel_mask),
                                                  0);
         }
+        pthread_mutex_unlock(&out->latch_lock);
         pthread_mutex_unlock(&out->lock);
     }
     return status;
@@ -6452,6 +6484,7 @@ static int out_resume(struct audio_stream_out* stream)
         ALOGD("copl(%p):resume compress driver", out);
         status = -ENODATA;
         lock_output_stream(out);
+        pthread_mutex_lock(&out->latch_lock);
         if (out->compr != NULL && out->offload_state == OFFLOAD_STATE_PAUSED) {
             if (out->card_status != CARD_STATUS_OFFLINE) {
                 status = compress_resume(out->compr);
@@ -6463,6 +6496,7 @@ static int out_resume(struct audio_stream_out* stream)
             audio_extn_dts_notify_playback_state(out->usecase, 0, out->sample_rate,
                                                      popcount(out->channel_mask), 1);
         }
+        pthread_mutex_unlock(&out->latch_lock);
         pthread_mutex_unlock(&out->lock);
     }
     return status;
@@ -6491,12 +6525,14 @@ static int out_flush(struct audio_stream_out* stream)
     if (is_offload_usecase(out->usecase)) {
         ALOGD("copl(%p):calling compress flush", out);
         lock_output_stream(out);
+        pthread_mutex_lock(&out->latch_lock);
         if (out->offload_state == OFFLOAD_STATE_PAUSED) {
             stop_compressed_output_l(out);
         } else {
             ALOGW("%s called in invalid state %d", __func__, out->offload_state);
         }
         out->written = 0;
+        pthread_mutex_unlock(&out->latch_lock);
         pthread_mutex_unlock(&out->lock);
         ALOGD("copl(%p):out of compress flush", out);
         return 0;
@@ -7780,7 +7816,7 @@ int adev_open_output_stream(struct audio_hw_device *dev,
 
     pthread_mutex_init(&out->lock, (const pthread_mutexattr_t *) NULL);
     pthread_mutex_init(&out->pre_lock, (const pthread_mutexattr_t *) NULL);
-    pthread_mutex_init(&out->compr_mute_lock, (const pthread_mutexattr_t *) NULL);
+    pthread_mutex_init(&out->latch_lock, (const pthread_mutexattr_t *) NULL);
     pthread_mutex_init(&out->position_query_lock, (const pthread_mutexattr_t *) NULL);
     pthread_cond_init(&out->cond, (const pthread_condattr_t *) NULL);
 
@@ -8695,6 +8731,9 @@ void adev_close_output_stream(struct audio_hw_device *dev __unused,
 
     pthread_cond_destroy(&out->cond);
     pthread_mutex_destroy(&out->lock);
+    pthread_mutex_destroy(&out->pre_lock);
+    pthread_mutex_destroy(&out->latch_lock);
+    pthread_mutex_destroy(&out->position_query_lock);
 
     pthread_mutex_lock(&adev->lock);
     streams_output_ctxt_t *out_ctxt = out_get_stream(adev, out->handle);
@@ -8757,7 +8796,7 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
     }
 
     ret = str_parms_get_str(parms, "A2dpSuspended", value, sizeof(value));
-    if (ret>=0) {
+    if (ret >= 0) {
         if (!strncmp(value, "false", 5) &&
             audio_extn_a2dp_source_is_suspended()) {
             struct audio_usecase *usecase;
@@ -8918,30 +8957,30 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
 
             if (is_a2dp_out_device_type(&usecase->device_list)) {
                 ALOGD("reconfigure a2dp... forcing device switch");
-                pthread_mutex_unlock(&adev->lock);
-                lock_output_stream(usecase->stream.out);
-                pthread_mutex_lock(&adev->lock);
                 audio_extn_a2dp_set_handoff_mode(true);
                 ALOGD("Switching to speaker and muting the stream before select_devices");
                 check_a2dp_restore_l(adev, usecase->stream.out, false);
                 //force device switch to re configure encoder
                 select_devices(adev, usecase->id);
                 ALOGD("Unmuting the stream after select_devices");
+                pthread_mutex_lock(&usecase->stream.out->latch_lock);
                 usecase->stream.out->a2dp_compress_mute = false;
-                out_set_compr_volume(&usecase->stream.out->stream, usecase->stream.out->volume_l, usecase->stream.out->volume_r);
+                out_set_compr_volume(&usecase->stream.out->stream,
+                                     usecase->stream.out->volume_l,
+                                     usecase->stream.out->volume_r);
+                pthread_mutex_unlock(&usecase->stream.out->latch_lock);
                 audio_extn_a2dp_set_handoff_mode(false);
-                pthread_mutex_unlock(&usecase->stream.out->lock);
                 break;
-            } else if ((usecase->stream.out->flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) &&
-                        usecase->stream.out->a2dp_compress_mute) {
-                pthread_mutex_unlock(&adev->lock);
-                lock_output_stream(usecase->stream.out);
-                pthread_mutex_lock(&adev->lock);
-                reassign_device_list(&usecase->stream.out->device_list,
-                                     AUDIO_DEVICE_OUT_BLUETOOTH_A2DP, "");
-                check_a2dp_restore_l(adev, usecase->stream.out, true);
-                pthread_mutex_unlock(&usecase->stream.out->lock);
-                break;
+            } else if (is_offload_usecase(usecase->stream.out->usecase)) {
+                pthread_mutex_lock(&usecase->stream.out->latch_lock);
+                if (usecase->stream.out->a2dp_compress_mute) {
+                    pthread_mutex_unlock(&usecase->stream.out->latch_lock);
+                    reassign_device_list(&usecase->stream.out->device_list,
+                                         AUDIO_DEVICE_OUT_BLUETOOTH_A2DP, "");
+                    check_a2dp_restore_l(adev, usecase->stream.out, true);
+                    break;
+                }
+                pthread_mutex_unlock(&usecase->stream.out->latch_lock);
             }
         }
     }
@@ -9120,7 +9159,7 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
         if (amplifier_set_mode(mode) != 0)
             ALOGE("Failed setting amplifier mode");
         adev->mode = mode;
-        if( mode == AUDIO_MODE_CALL_SCREEN ){
+        if (mode == AUDIO_MODE_CALL_SCREEN) {
             adev->current_call_output = adev->primary_output;
             voice_start_call(adev);
         } else if (voice_is_in_call_or_call_screen(adev) &&
@@ -9771,6 +9810,9 @@ static void adev_close_input_stream(struct audio_hw_device *dev,
     } else
         in_standby(&stream->common);
 
+    pthread_mutex_destroy(&in->lock);
+    pthread_mutex_destroy(&in->pre_lock);
+
     pthread_mutex_lock(&adev->lock);
     if (in->usecase == USECASE_AUDIO_RECORD) {
         adev->pcm_record_uc_state = 0;
@@ -10363,6 +10405,7 @@ static void adev_snd_mon_cb(void *cookie, struct str_parms *parms)
     pthread_mutex_lock(&adev->lock);
     if (card == adev->snd_card || is_ext_device_status) {
         if (is_snd_card_status && adev->card_status != status) {
+            ALOGD("%s card_status %d", __func__, status);
             adev->card_status = status;
             platform_snd_card_update(adev->platform, status);
             audio_extn_fm_set_parameters(adev, parms);
@@ -10377,8 +10420,8 @@ static void adev_snd_mon_cb(void *cookie, struct str_parms *parms)
     return;
 }
 
-/* out and adev lock held */
-static int check_a2dp_restore_l(struct audio_device *adev, struct stream_out *out, bool restore)
+/* adev lock held */
+int check_a2dp_restore_l(struct audio_device *adev, struct stream_out *out, bool restore)
 {
     struct audio_usecase *uc_info;
     float left_p;
@@ -10397,23 +10440,26 @@ static int check_a2dp_restore_l(struct audio_device *adev, struct stream_out *ou
           out->usecase, use_case_table[out->usecase]);
 
     if (restore) {
+        pthread_mutex_lock(&out->latch_lock);
         // restore A2DP device for active usecases and unmute if required
         if (is_a2dp_out_device_type(&out->device_list)) {
             ALOGD("%s: restoring A2dp and unmuting stream", __func__);
             if (uc_info->out_snd_device != SND_DEVICE_OUT_BT_A2DP)
                 select_devices(adev, uc_info->id);
-            pthread_mutex_lock(&out->compr_mute_lock);
-            if ((out->flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) &&
-                (out->a2dp_compress_mute) && (uc_info->out_snd_device == SND_DEVICE_OUT_BT_A2DP)) {
-                out->a2dp_compress_mute = false;
-                out_set_compr_volume(&out->stream, out->volume_l, out->volume_r);
+            if (is_offload_usecase(out->usecase) &&
+                (uc_info->out_snd_device == SND_DEVICE_OUT_BT_A2DP)) {
+                if (out->a2dp_compress_mute) {
+                    out->a2dp_compress_mute = false;
+                    out_set_compr_volume(&out->stream, out->volume_l, out->volume_r);
+                }
             }
-            pthread_mutex_unlock(&out->compr_mute_lock);
         }
+        out->muted = false;
+        pthread_mutex_unlock(&out->latch_lock);
     } else {
-        if (out->flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
+        pthread_mutex_lock(&out->latch_lock);
+        if (is_offload_usecase(out->usecase)) {
             // mute compress stream if suspended
-            pthread_mutex_lock(&out->compr_mute_lock);
             if (!out->a2dp_compress_mute && !out->standby) {
                 ALOGD("%s: selecting speaker and muting stream", __func__);
                 assign_devices(&devices, &out->device_list);
@@ -10431,29 +10477,16 @@ static int check_a2dp_restore_l(struct audio_device *adev, struct stream_out *ou
                 out->volume_l = left_p;
                 out->volume_r = right_p;
             }
-            pthread_mutex_unlock(&out->compr_mute_lock);
         } else {
-            // tear down a2dp path for non offloaded streams
-            if (audio_extn_a2dp_source_is_suspended())
-                out_standby_l(&out->stream.common);
+            // mute for non offloaded streams
+            if (audio_extn_a2dp_source_is_suspended()) {
+                out->muted = true;
+            }
         }
+        pthread_mutex_unlock(&out->latch_lock);
     }
     ALOGV("%s: exit", __func__);
     return 0;
-}
-
-int check_a2dp_restore(struct audio_device *adev, struct stream_out *out, bool restore)
-{
-    int ret = 0;
-
-    lock_output_stream(out);
-    pthread_mutex_lock(&adev->lock);
-
-    ret = check_a2dp_restore_l(adev, out, restore);
-
-    pthread_mutex_unlock(&adev->lock);
-    pthread_mutex_unlock(&out->lock);
-    return ret;
 }
 
 void adev_on_battery_status_changed(bool charging)
@@ -10803,7 +10836,7 @@ static int adev_open(const hw_module_t *module, const char *name,
         adev->use_old_pspd_mix_ctrl = true;
     }
 
-    ALOGV("%s: exit", __func__);
+    ALOGD("%s: exit", __func__);
     return 0;
 
 adev_open_err:
