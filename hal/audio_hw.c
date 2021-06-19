@@ -3649,11 +3649,9 @@ static int create_offload_callback_thread(struct stream_out *out)
 static int destroy_offload_callback_thread(struct stream_out *out)
 {
     lock_output_stream(out);
-    pthread_mutex_lock(&out->latch_lock);
     stop_compressed_output_l(out);
     send_offload_cmd_l(out, OFFLOAD_CMD_EXIT);
 
-    pthread_mutex_unlock(&out->latch_lock);
     pthread_mutex_unlock(&out->lock);
     pthread_join(out->offload_thread, (void **) NULL);
     pthread_cond_destroy(&out->offload_cond);
@@ -4629,9 +4627,7 @@ static int out_on_error(struct audio_stream *stream)
     // is needed e.g. when SSR happens within compress_open
     // since the stream is active, offload_callback_thread is also active.
     if (out->flags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
-        pthread_mutex_lock(&out->latch_lock);
         stop_compressed_output_l(out);
-        pthread_mutex_unlock(&out->latch_lock);
     }
     pthread_mutex_unlock(&out->lock);
 
@@ -6527,7 +6523,6 @@ static int out_flush(struct audio_stream_out* stream)
             pthread_mutex_unlock(&out->latch_lock);
         }
         out->written = 0;
-        pthread_mutex_unlock(&out->latch_lock);
         pthread_mutex_unlock(&out->lock);
         ALOGD("copl(%p):out of compress flush", out);
         return 0;
